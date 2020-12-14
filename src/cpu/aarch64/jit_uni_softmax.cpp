@@ -30,7 +30,6 @@
 #include "cpu/aarch64/jit_uni_softmax.hpp"
 
 #define IDX(a) static_cast<uint32_t>(a.getIdx())
-#define DUMMY_IDX 30
 
 #if __INTEL_COMPILER && __INTEL_COMPILER < 1900
 // Intel Compilers 17.x and 18.x do not like that diff_src_ptr() is only used
@@ -64,13 +63,14 @@ struct jit_softmax_base_t : public jit_generator {
     const softmax_pd_t *pd_;
     const memory_desc_wrapper data_d_;
 
+    virtual void operator()(const call_params_t *p) = 0;
     std::unique_ptr<jit_uni_eltwise_injector_f32<isa>> exp_injector_;
     std::unique_ptr<jit_uni_eltwise_injector_f32<isa>> log_injector_;
 
     XReg reg_param = abi_param1;
 
 #if 1
-    XReg reg_exp_injector_table = x0;
+    XReg reg_exp_injector_table = x1;
     XReg reg_log_injector_table = x3;
     XReg reg_src = x8;
     XReg reg_diff_src = reg_src;
@@ -137,11 +137,11 @@ struct jit_softmax_base_t : public jit_generator {
     }
 
     void load_common_params() {
-	printf("load_common_params\n");
+        printf("load_common_params\n");
         mov(WReg(IDX(reg_tmp)), float2int(1.0f));
-	dup(ZRegS(IDX(vone)), WReg(IDX(reg_tmp)));
+        dup(ZRegS(IDX(vone)), WReg(IDX(reg_tmp)));
         mov(reg_tmp, float2int(-FLT_MAX));
-	dup(ZRegS(IDX(vneg_flt_max)), WReg(IDX(reg_tmp)));
+        dup(ZRegS(IDX(vneg_flt_max)), WReg(IDX(reg_tmp)));
 
 #define PARAM_OFF(x) offsetof(call_params_t, x)
 #define PARAM_OFF_DIFF(x, y) \
@@ -157,14 +157,15 @@ struct jit_softmax_base_t : public jit_generator {
             && static_cast<int32_t>(x) - static_cast<int32_t>(y) <= 256); \
     str(X_TMP_0, pre_ptr(x_tmp_sp, x - y));
 
-	mov(X_DEFAULT_ADDR, XReg(IDX(reg_param)));
-	ldr(XReg(IDX(reg_spat_offt_count)), pre_ptr(X_DEFAULT_ADDR, PARAM_OFF(spat_offt_count)));
-	LDR_PARAM(reg_dst, dst, spat_offt_count);
+        mov(X_DEFAULT_ADDR, XReg(IDX(reg_param)));
+        ldr(XReg(IDX(reg_spat_offt_count)),
+                pre_ptr(X_DEFAULT_ADDR, PARAM_OFF(spat_offt_count)));
+        LDR_PARAM(reg_dst, dst, spat_offt_count);
         if (pd_->is_fwd()) {
             LDR_PARAM(reg_src, src, dst);
         } else {
-	    LDR_PARAM(reg_diff_src, src, dst); // src is reused
-	    LDR_PARAM(reg_diff_dst, diff_dst, src);
+            LDR_PARAM(reg_diff_src, src, dst); // src is reused
+            LDR_PARAM(reg_diff_dst, diff_dst, src);
         }
 #undef LDR_PARAM
 #undef LDR_PARAM_TMP
@@ -172,13 +173,32 @@ struct jit_softmax_base_t : public jit_generator {
 #undef PARAM_OFF
     }
 
-    void uni_fmax(const ZReg &dst, const ZReg &src, const ZReg &src2, const PReg &mask) {
+    void uni_fmax(const ZReg &dst, const ZReg &src, const ZReg &src2,
+            const PReg &mask) {
         mov(z_tmp0.s, P_ALL_ONE, ZRegS(IDX(src2)));
-	fmaxnm(z_tmp0.s, p_512, ZRegS(IDX(src)));
-	fmax(z_tmp0.s, p_512, ZRegS(IDX(src)));
-	mov(ZRegS(IDX(dst)), PReg(IDX(mask)) / T_m, z_tmp0.s);
+        fmaxnm(z_tmp0.s, p_512, ZRegS(IDX(src)));
+        fmax(z_tmp0.s, p_512, ZRegS(IDX(src)));
+        mov(ZRegS(IDX(dst)), PReg(IDX(mask)) / T_m, z_tmp0.s);
     }
 
+#if 1
+    XReg xreg_addr(const XReg &base, const XReg &off = XReg(DUMMY_IDX),
+            const int disp = 0) {
+        XReg x_addr = base;
+        uint32_t offIdx = off.getIdx();
+
+        if (offIdx <= SP_IDX) {
+            add(X_DEFAULT_ADDR, base, off);
+            x_addr = X_DEFAULT_ADDR;
+        }
+        if (disp) {
+            add_imm(X_DEFAULT_ADDR, x_addr, disp, X_TMP_0);
+            x_addr = X_DEFAULT_ADDR;
+        }
+
+        return x_addr;
+    }
+#else
     XReg xreg_addr(const XReg &base, const XReg &off = XReg(DUMMY_IDX),
             const int disp = 0) {
         XReg x_addr = base;
@@ -199,6 +219,7 @@ struct jit_softmax_base_t : public jit_generator {
 
         return x_addr;
     }
+#endif
 
     XReg diff_src_ptr(size_t offt = 0) {
         return xreg_addr(reg_diff_src, reg_spat_offt, offt);
@@ -219,7 +240,7 @@ struct jit_softmax_base_t : public jit_generator {
     enum class op_t : unsigned { max, sum };
 
     void perform_op(ZReg v, ZReg vtmp, op_t op) {
-	printf("perform_op\n");
+        printf("perform_op\n");
         if (op == op_t::max)
             uni_fmax(v, v, vtmp, P_ALL_ONE);
         else if (op == op_t::sum)
@@ -228,12 +249,13 @@ struct jit_softmax_base_t : public jit_generator {
 
     template <typename body_t>
     void axis_loop(body_t body) {
-	printf("axis_loop\n");
+        printf("axis_loop\n");
         Label main_loop, tail_loop, tail_axis;
 
         // reverse_spat_offt to dispatch between labels
         mov(reg_reverse_spat_offt, reg_spat_offt_count);
-        eor(reg_spat_offt, reg_spat_offt, reg_spat_offt); // spat_offt to get addr of src/dst
+        eor(reg_spat_offt, reg_spat_offt,
+                reg_spat_offt); // spat_offt to get addr of src/dst
         L(main_loop);
         {
             if (n_loops_) {
@@ -241,7 +263,8 @@ struct jit_softmax_base_t : public jit_generator {
                 b(LT, tail_loop);
 
                 body(unroll_regs_, false);
-                sub(reg_reverse_spat_offt, reg_reverse_spat_offt, unroll_regs_ * axis_stride_);
+                sub(reg_reverse_spat_offt, reg_reverse_spat_offt,
+                        unroll_regs_ * axis_stride_);
                 add(reg_spat_offt, reg_spat_offt, unroll_regs_ * axis_stride_);
                 b(main_loop);
             }
@@ -262,7 +285,8 @@ struct jit_softmax_base_t : public jit_generator {
     }
 
     virtual void prepare_tail_mask() = 0;
-    virtual void get_horizontal_op(const ZReg &v, const ZReg &vtmp, op_t op) = 0;
+    virtual void get_horizontal_op(const ZReg &v, const ZReg &vtmp, op_t op)
+            = 0;
     virtual void accumulate_vmax() = 0;
     virtual void accumulate_vsum() = 0;
     virtual void compute_dst() = 0;
@@ -285,7 +309,7 @@ struct jit_softmax_base_t : public jit_generator {
     // that are participated are not defined at the moment of base ctor
     // initialization.
     void generate() override {
-	printf("generate\n");
+        printf("generate\n");
         if (pd_->is_fwd() || is_logsoftmax_)
             exp_injector_.reset(new jit_uni_eltwise_injector_f32<isa>(this,
                     alg_kind::eltwise_exp, 0.0f, 0.0f, 1.0f, true,
@@ -298,14 +322,13 @@ struct jit_softmax_base_t : public jit_generator {
 
         compute_predefined_variables();
         preamble();
-
-        mov(XReg(DUMMY_IDX), 0);
+        initialization_hook();
 
         if (isa == sve_512) ptrue(p_512.b);
 
         if (exp_injector_) exp_injector_->load_table_addr();
         if (log_injector_) log_injector_->load_table_addr();
-	//adr(x0, 0xe00);
+        //adr(x0, 0xe00);
         if (axis_simd_tail_) prepare_tail_mask();
         load_common_params();
         if (pd_->is_fwd())
@@ -315,24 +338,22 @@ struct jit_softmax_base_t : public jit_generator {
         postamble();
         if (exp_injector_) {
             exp_injector_->prepare_table();
-            //binCommit();
+            //            binCommit();
         }
         if (log_injector_) {
             log_injector_->prepare_table();
-            //binCommit();
+            //            binCommit();
         }
     }
 
-    void operator()(const call_params_t *p) { jit_generator::operator()(p); }
-
     jit_softmax_base_t(const softmax_pd_t *pd)
-        : pd_(pd), data_d_(pd_->dst_md()) {
+        : jit_generator(nullptr, MAX_CODE_SIZE, true, isa)
+        , pd_(pd)
+        , data_d_(pd_->dst_md()) {
         is_bf16_ = data_d_.data_type() == data_type::bf16;
         data_type_size_ = is_bf16_ ? sizeof(bfloat16_t) : sizeof(float);
         simd_w_ = vlen / sizeof(float); // bf16 works on ymms
     }
-
-    ~jit_softmax_base_t() override {}
 };
 
 template <cpu_isa_t isa>
@@ -343,18 +364,24 @@ struct jit_softmax_t<sve_512> : public jit_softmax_base_t<sve_512> {
     PReg tail_opmask = PReg(2);
 
     void store(const XReg &addr, const ZReg &vmm, bool tail = false) {
-        if (tail) st1w(ZRegS(IDX(vmm)), PReg(IDX(tail_opmask)) / T_m, ptr(XReg(IDX(addr)))); 
-	else str(ZReg(IDX(vmm)), ptr(XReg(IDX(addr))));
+        if (tail)
+            st1w(ZRegS(IDX(vmm)), PReg(IDX(tail_opmask)) / T_m,
+                    ptr(XReg(IDX(addr))));
+        else
+            str(ZReg(IDX(vmm)), ptr(XReg(IDX(addr))));
     };
 
     void load(const ZReg &vmm, const XReg &addr, bool tail = false) {
-        if (tail) ld1w(ZRegS(IDX(vmm)), PReg(IDX(tail_opmask)) / T_z, ptr(XReg(IDX(addr)))); 
-	else ldr(ZReg(IDX(vmm)), ptr(XReg(IDX(addr))));
+        if (tail)
+            ld1w(ZRegS(IDX(vmm)), PReg(IDX(tail_opmask)) / T_z,
+                    ptr(XReg(IDX(addr))));
+        else
+            ldr(ZReg(IDX(vmm)), ptr(XReg(IDX(addr))));
     };
 
     void prepare_tail_mask() override {
-	printf("prepare_tail_mask\n");
-	const int sw_tail = pd_->C() % simd_w_;
+        printf("prepare_tail_mask\n");
+        const int sw_tail = pd_->C() % simd_w_;
         uint32_t idx = IDX(tail_opmask);
         switch (sw_tail) {
             case 16: ptrue(PRegS(idx), VL16); break;
@@ -373,44 +400,43 @@ struct jit_softmax_t<sve_512> : public jit_softmax_base_t<sve_512> {
         }
     }
 
-
     void get_horizontal_op(const ZReg &v, const ZReg &vtmp, op_t op) override {
-	printf("get_horizontal_op\n");
-	mov(ZRegS(IDX(vtmp)), P_ALL_ONE, ZRegS(IDX(v)));
-	ext(ZRegB(IDX(vtmp)), ZRegB(IDX(v)), 32);
+        printf("get_horizontal_op\n");
+        mov(ZRegS(IDX(vtmp)), P_ALL_ONE, ZRegS(IDX(v)));
+        ext(ZRegB(IDX(vtmp)), ZRegB(IDX(v)), 32);
         perform_op(v, vtmp, op);
-	not_(P_TMP_1.b, P_ALL_ONE, P_ALL_ONE.b);
-	trn1(P_TMP_0.d, P_ALL_ONE.d, P_TMP_1.d);
-	trn1(P_TMP_0.d, P_TMP_0.d, P_TMP_0.d);
-	mov(ZRegS(IDX(vtmp)), P_ALL_ONE, ZRegS(IDX(v)));
-	mov(z_tmp0.s, P_ALL_ONE, ZRegS(IDX(v)));
-	ext(z_tmp0.b, ZRegB(IDX(v)), 48);
-	ext(ZRegB(IDX(vtmp)), ZRegB(IDX(v)), 16);
-	mov(ZRegD(IDX(vtmp)), P_TMP_0 / T_m, z_tmp0.d);
+        not_(P_TMP_1.b, P_ALL_ONE, P_ALL_ONE.b);
+        trn1(P_TMP_0.d, P_ALL_ONE.d, P_TMP_1.d);
+        trn1(P_TMP_0.d, P_TMP_0.d, P_TMP_0.d);
+        mov(ZRegS(IDX(vtmp)), P_ALL_ONE, ZRegS(IDX(v)));
+        mov(z_tmp0.s, P_ALL_ONE, ZRegS(IDX(v)));
+        ext(z_tmp0.b, ZRegB(IDX(v)), 48);
+        ext(ZRegB(IDX(vtmp)), ZRegB(IDX(v)), 16);
+        mov(ZRegD(IDX(vtmp)), P_TMP_0 / T_m, z_tmp0.d);
         perform_op(v, vtmp, op);
-	uzp2(z_tmp0.d, ZRegD(IDX(v)), ZRegD(IDX(v)));
-	trn1(ZRegD(IDX(vtmp)), z_tmp0.d, ZRegD(IDX(v)));
+        uzp2(z_tmp0.d, ZRegD(IDX(v)), ZRegD(IDX(v)));
+        trn1(ZRegD(IDX(vtmp)), z_tmp0.d, ZRegD(IDX(v)));
         perform_op(v, vtmp, op);
-	trn1(P_TMP_0.s, P_ALL_ONE.s, P_TMP_1.s);
-	trn1(ZRegS(IDX(vtmp)), ZRegS(IDX(v)), ZRegS(IDX(v)));
-	trn2(z_tmp0.s, ZRegS(IDX(v)), ZRegS(IDX(v)));
-	mov(ZRegS(IDX(vtmp)), P_TMP_0 / T_m, z_tmp0.s);
+        trn1(P_TMP_0.s, P_ALL_ONE.s, P_TMP_1.s);
+        trn1(ZRegS(IDX(vtmp)), ZRegS(IDX(v)), ZRegS(IDX(v)));
+        trn2(z_tmp0.s, ZRegS(IDX(v)), ZRegS(IDX(v)));
+        mov(ZRegS(IDX(vtmp)), P_TMP_0 / T_m, z_tmp0.s);
         perform_op(v, vtmp, op);
     }
 
     void accumulate_vmax() override {
-	printf("accumulate_vmax\n");
+        printf("accumulate_vmax\n");
         // flush to -FLT_MAX before accumulation
-	mov(ZRegB(IDX(vmax)), P_ALL_ONE, ZRegB(IDX(vneg_flt_max)));
+        mov(ZRegB(IDX(vmax)), P_ALL_ONE, ZRegB(IDX(vneg_flt_max)));
 
         axis_loop([&](int unroll, bool tail = false) {
             for (int i = 0; i < unroll; i++) {
                 ZReg vreg_tmp_src = ZReg(i + 1);
                 load(vreg_tmp_src, src_ptr(axis_stride_ * i), tail); // SEGV
                 if (tail)
-		    uni_fmax(vmax, vmax, vreg_tmp_src, tail_opmask);
+                    uni_fmax(vmax, vmax, vreg_tmp_src, tail_opmask);
                 else
-		    uni_fmax(vmax, vmax, vreg_tmp_src, P_ALL_ONE);
+                    uni_fmax(vmax, vmax, vreg_tmp_src, P_ALL_ONE);
             }
         });
 
@@ -418,7 +444,7 @@ struct jit_softmax_t<sve_512> : public jit_softmax_base_t<sve_512> {
     }
 
     void accumulate_vsum() override {
-	printf("accumulate_vsum\n");
+        printf("accumulate_vsum\n");
         eor(vsum.d, vsum.d, vsum.d); // flush to zero before accumulation
 
         axis_loop([&](int unroll, bool tail = false) {
@@ -430,9 +456,11 @@ struct jit_softmax_t<sve_512> : public jit_softmax_base_t<sve_512> {
                     store(dst_ptr(axis_stride_ * i), vreg_tmp_src, tail);
                 exp_injector_->compute_vector(vreg_tmp_src.getIdx());
                 if (tail)
-		    fadd(ZRegS(IDX(vsum)), PReg(IDX(tail_opmask)) / T_m, ZRegS(IDX(vreg_tmp_src)));
+                    fadd(ZRegS(IDX(vsum)), PReg(IDX(tail_opmask)) / T_m,
+                            ZRegS(IDX(vreg_tmp_src)));
                 else
-		    fadd(ZRegS(IDX(vsum)), ZRegS(IDX(vsum)), ZRegS(IDX(vreg_tmp_src)));
+                    fadd(ZRegS(IDX(vsum)), ZRegS(IDX(vsum)),
+                            ZRegS(IDX(vreg_tmp_src)));
                 if (is_softmax_) // store after applying exp
                     store(dst_ptr(axis_stride_ * i), vreg_tmp_src, tail);
             }
@@ -441,20 +469,21 @@ struct jit_softmax_t<sve_512> : public jit_softmax_base_t<sve_512> {
         get_horizontal_op(vsum, vtmp = vmax, op_t::sum);
         if (is_softmax_) {
             mov(z_tmp0.d, ZRegD(IDX(vsum)));
-	    mov(ZRegD(IDX(vsum)), P_ALL_ONE, ZRegD(IDX(vone)));
-	    fdiv(ZRegS(IDX(vsum)), p_512 / T_m, z_tmp0.s);
-	}
+            mov(ZRegD(IDX(vsum)), P_ALL_ONE, ZRegD(IDX(vone)));
+            fdiv(ZRegS(IDX(vsum)), p_512 / T_m, z_tmp0.s);
+        }
         if (is_logsoftmax_) log_injector_->compute_vector(vsum.getIdx());
     }
 
     void compute_dst() override {
-	printf("compute_dst\n");
+        printf("compute_dst\n");
         axis_loop([&](int unroll, bool tail = false) {
             for (int i = 0; i < unroll; i++) {
                 ZReg vreg_tmp_src = ZReg(i + 1);
                 if (is_softmax_) {
                     load(vreg_tmp_src, dst_ptr(axis_stride_ * i), tail);
-                    fmul(ZRegS(IDX(vreg_tmp_src)), ZRegS(IDX(vreg_tmp_src)), ZRegS(IDX(vsum)));
+                    fmul(ZRegS(IDX(vreg_tmp_src)), ZRegS(IDX(vreg_tmp_src)),
+                            ZRegS(IDX(vsum)));
                 }
                 if (is_logsoftmax_) {
                     load(vreg_tmp_src, dst_ptr(axis_stride_ * i), tail);
@@ -466,7 +495,7 @@ struct jit_softmax_t<sve_512> : public jit_softmax_base_t<sve_512> {
     }
 
     void accumulate_vsbr() override {
-	printf("accumulate_vsbr\n");
+        printf("accumulate_vsbr\n");
         eor(vsbr.d, vsbr.d, vsbr.d); // flush to zero before accumulation
 
         axis_loop([&](int unroll, bool tail = false) {
@@ -476,9 +505,12 @@ struct jit_softmax_t<sve_512> : public jit_softmax_base_t<sve_512> {
                 load(vreg_tmp_diff_dst, diff_dst_ptr(axis_stride_ * i), tail);
                 if (is_softmax_) {
                     load(vreg_tmp_dst, dst_ptr(axis_stride_ * i), tail);
-                    fmul(ZRegS(IDX(vreg_tmp_diff_dst)), ZRegS(IDX(vreg_tmp_diff_dst)), ZRegS(IDX(vreg_tmp_dst)));
+                    fmul(ZRegS(IDX(vreg_tmp_diff_dst)),
+                            ZRegS(IDX(vreg_tmp_diff_dst)),
+                            ZRegS(IDX(vreg_tmp_dst)));
                 }
-		fadd(ZRegS(IDX(vsbr)), ZRegS(IDX(vsbr)), ZRegS(IDX(vreg_tmp_diff_dst)));
+                fadd(ZRegS(IDX(vsbr)), ZRegS(IDX(vsbr)),
+                        ZRegS(IDX(vreg_tmp_diff_dst)));
             }
         });
 
@@ -486,7 +518,7 @@ struct jit_softmax_t<sve_512> : public jit_softmax_base_t<sve_512> {
     }
 
     void compute_diff_src() override {
-	printf("compute_diff_src\n");
+        printf("compute_diff_src\n");
         axis_loop([&](int unroll, bool tail = false) {
             for (int i = 0; i < unroll; i++) {
                 ZReg vreg_tmp_dst = ZReg(i * 2 + 1);
@@ -495,35 +527,51 @@ struct jit_softmax_t<sve_512> : public jit_softmax_base_t<sve_512> {
                 load(vreg_tmp_diff_dst, diff_dst_ptr(axis_stride_ * i), tail);
                 if (is_softmax_) {
                     fsub(vreg_tmp_diff_dst.s, vreg_tmp_diff_dst.s, vsbr.s);
-		    fmul(ZRegS(IDX(vreg_tmp_diff_dst)), ZRegS(IDX(vreg_tmp_dst)), ZRegS(IDX(vreg_tmp_diff_dst)));
+                    fmul(ZRegS(IDX(vreg_tmp_diff_dst)),
+                            ZRegS(IDX(vreg_tmp_dst)),
+                            ZRegS(IDX(vreg_tmp_diff_dst)));
                 }
                 if (is_logsoftmax_) {
                     exp_injector_->compute_vector(vreg_tmp_dst.getIdx());
-		    fmls(ZRegS(IDX(vreg_tmp_diff_dst)), p_512 / T_m, ZRegS(IDX(vreg_tmp_dst)), ZRegS(IDX(vsbr)));
+                    fmls(ZRegS(IDX(vreg_tmp_diff_dst)), p_512 / T_m,
+                            ZRegS(IDX(vreg_tmp_dst)), ZRegS(IDX(vsbr)));
                 }
                 store(diff_src_ptr(axis_stride_ * i), vreg_tmp_diff_dst, tail);
             }
         });
     }
 
-    jit_softmax_t(const softmax_pd_t *pd) : jit_softmax_base_t(pd) {}
+    void initialization_hook() override {
+        //if (bf16_emu_) bf16_emu_->init_vcvtneps2bf16();
+    }
+
+    jit_softmax_t(const softmax_pd_t *pd) : jit_softmax_base_t(pd) {
+        /*        if (is_bf16_ && !mayiuse(avx512_core_bf16))
+            bf16_emu_.reset(new bf16_emulation_t(this, bf16_emu_zmm_1,
+                    bf16_emu_zmm_2, bf16_emu_zmm_3, bf16_emu_gpr,
+                    bf16_emu_zmm_4, bf16_emu_zmm_5)); */
+    }
+
+    void operator()(const call_params_t *p) override {
+        return jit_generator::operator()(p);
+    }
 };
 
 } // namespace
 
 template <cpu_isa_t isa>
 jit_uni_softmax_fwd_t<isa>::jit_uni_softmax_fwd_t(const pd_t *apd)
-    : primitive_t(apd) {}
-
-template <cpu_isa_t isa>
-status_t jit_uni_softmax_fwd_t<isa>::init(engine_t *engine) {
-    CHECK(safe_ptr_assign(softmax_driver_, new softmax_impl::driver_t<isa>(pd())));
-    return softmax_driver_->create_kernel();
-}
+    : primitive_t(apd)
+    , softmax_driver_(new softmax_impl::driver_t<isa>(pd())) {}
 
 template <cpu_isa_t isa>
 jit_uni_softmax_fwd_t<isa>::~jit_uni_softmax_fwd_t() {
     delete softmax_driver_;
+}
+
+template <cpu_isa_t isa>
+status_t jit_uni_softmax_fwd_t<isa>::init(engine_t *engine) {
+    return softmax_driver_->create_kernel();
 }
 
 template <cpu_isa_t isa>
@@ -556,17 +604,17 @@ status_t jit_uni_softmax_fwd_t<isa>::execute(const exec_ctx_t &ctx) const {
 
 template <cpu_isa_t isa>
 jit_uni_softmax_bwd_t<isa>::jit_uni_softmax_bwd_t(const pd_t *apd)
-    : primitive_t(apd) {}
-
-template <cpu_isa_t isa>
-status_t jit_uni_softmax_bwd_t<isa>::init(engine_t *engine) {
-    CHECK(safe_ptr_assign(softmax_driver_, new softmax_impl::driver_t<isa>(pd())));
-    return softmax_driver_->create_kernel();
-}
+    : primitive_t(apd)
+    , softmax_driver_(new softmax_impl::driver_t<isa>(pd())) {}
 
 template <cpu_isa_t isa>
 jit_uni_softmax_bwd_t<isa>::~jit_uni_softmax_bwd_t() {
     delete softmax_driver_;
+}
+
+template <cpu_isa_t isa>
+status_t jit_uni_softmax_bwd_t<isa>::init(engine_t *engine) {
+    return softmax_driver_->create_kernel();
 }
 
 template <cpu_isa_t isa>
@@ -606,7 +654,6 @@ template <cpu_isa_t isa>
 struct driver_t : public c_compatible {
 
     driver_t(const softmax_pd_t *pd) : pd_(pd), ker_(pd_) {}
-    ~driver_t() = default;
 
     void exec(const void *src, void *dst, const dim_t outer_stride) {
         typename jit_softmax_t<isa>::call_params_t p;
